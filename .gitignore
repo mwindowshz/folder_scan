@@ -1,0 +1,4 @@
+debug.log
+build/FolderContentSearch/
+__pycache__/folder_content_search.cpython-314.pyc
+dist/FolderContentSearch.exe
