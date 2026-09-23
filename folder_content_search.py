@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
 import os
 import queue
 import subprocess
 import sys
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
@@ -61,9 +65,31 @@ def file_contains(path: str, patterns: list[bytes], case_sensitive: bool) -> boo
             tail = data[-overlap:] if overlap else b""
 
 
-def license_app_reports_match(output: str) -> bool:
-    normalized = " ".join(output.split()).casefold()
-    return "the files match" in normalized and "do not match" not in normalized
+def check_match_via_server(server_url: str, file_1: str, file_2: str) -> bool:
+    payload = json.dumps({"file_1": file_1, "file_2": file_2}).encode("utf-8")
+    request = urllib.request.Request(
+        server_url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        data = response.read().decode("utf-8", errors="replace")
+    parsed = json.loads(data)
+    return bool(parsed.get("match"))
+
+
+def wait_for_server(host: str, port: int, timeout_seconds: float = 30.0) -> bool:
+    import socket
+
+    deadline = datetime.now().timestamp() + timeout_seconds
+    while datetime.now().timestamp() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=1.0):
+                return True
+        except OSError:
+            pass
+    return False
 
 
 class FolderSearchApp(tk.Tk):
@@ -76,7 +102,8 @@ class FolderSearchApp(tk.Tk):
         self.folder_var = tk.StringVar()
         self.search_var = tk.StringVar()
         self.source_file_var = tk.StringVar()
-        self.license_app_var = tk.StringVar()
+        self.server_exe_var = tk.StringVar()
+        self.server_url_var = tk.StringVar(value="http://127.0.0.1:1949/Protrack-LMS/License/check_match")
         self.recursive_var = tk.BooleanVar(value=True)
         self.case_var = tk.BooleanVar(value=True)
         self.compare_mode_var = tk.BooleanVar(value=False)
@@ -99,7 +126,7 @@ class FolderSearchApp(tk.Tk):
         self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
         root.columnconfigure(1, weight=1)
-        root.rowconfigure(6, weight=1)
+        root.rowconfigure(7, weight=1)
 
         ttk.Label(root, text="Folder:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
         folder_entry = ttk.Entry(root, textvariable=self.folder_var)
@@ -120,25 +147,29 @@ class FolderSearchApp(tk.Tk):
             row=2, column=2, sticky="ew", padx=(8, 0), pady=4
         )
 
-        ttk.Label(root, text="LicenseApp exe:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
-        app_entry = ttk.Entry(root, textvariable=self.license_app_var)
+        ttk.Label(root, text="LicenseServer exe:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+        app_entry = ttk.Entry(root, textvariable=self.server_exe_var)
         app_entry.grid(row=3, column=1, sticky="ew", pady=4)
         ttk.Button(root, text="Browse...", command=self._choose_license_app).grid(
             row=3, column=2, sticky="ew", padx=(8, 0), pady=4
         )
 
+        ttk.Label(root, text="Server URL:").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=4)
+        server_url_entry = ttk.Entry(root, textvariable=self.server_url_var)
+        server_url_entry.grid(row=4, column=1, sticky="ew", pady=4)
+
         options = ttk.Frame(root)
-        options.grid(row=4, column=1, columnspan=2, sticky="w", pady=(3, 8))
+        options.grid(row=5, column=1, columnspan=2, sticky="w", pady=(3, 8))
         ttk.Checkbutton(options, text="Include subfolders", variable=self.recursive_var).pack(side="left")
         ttk.Checkbutton(options, text="Case-sensitive", variable=self.case_var).pack(side="left", padx=(18, 0))
-        ttk.Checkbutton(options, text="LicenseApp compare mode", variable=self.compare_mode_var).pack(
+        ttk.Checkbutton(options, text="LicenseServer compare mode", variable=self.compare_mode_var).pack(
             side="left", padx=(18, 0)
         )
         ttk.Checkbutton(options, text="Compare .pt", variable=self.compare_pt_var).pack(side="left", padx=(18, 0))
         ttk.Checkbutton(options, text="Compare .ptl", variable=self.compare_ptl_var).pack(side="left", padx=(12, 0))
 
         actions = ttk.Frame(root)
-        actions.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        actions.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(0, 10))
         self.search_button = ttk.Button(actions, text="Search", command=self._start_search)
         self.search_button.pack(side="left")
         self.cancel_button = ttk.Button(actions, text="Cancel", command=self._cancel_search, state="disabled")
@@ -146,7 +177,7 @@ class FolderSearchApp(tk.Tk):
         ttk.Button(actions, text="Clear results", command=self._clear_results).pack(side="left", padx=(8, 0))
 
         results_frame = ttk.Frame(root)
-        results_frame.grid(row=6, column=0, columnspan=3, sticky="nsew")
+        results_frame.grid(row=7, column=0, columnspan=3, sticky="nsew")
         results_frame.rowconfigure(0, weight=1)
         results_frame.columnconfigure(0, weight=1)
 
@@ -167,16 +198,16 @@ class FolderSearchApp(tk.Tk):
         self.results.configure(yscrollcommand=scrollbar.set)
 
         result_actions = ttk.Frame(root)
-        result_actions.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        result_actions.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(10, 0))
         ttk.Button(result_actions, text="Open selected file", command=self._open_selected).pack(side="left")
         ttk.Button(result_actions, text="Open containing folder", command=self._reveal_selected).pack(
             side="left", padx=(8, 0)
         )
 
-        ttk.Separator(root).grid(row=8, column=0, columnspan=3, sticky="ew", pady=(12, 7))
-        ttk.Label(root, textvariable=self.status_var).grid(row=9, column=0, columnspan=2, sticky="w")
+        ttk.Separator(root).grid(row=9, column=0, columnspan=3, sticky="ew", pady=(12, 7))
+        ttk.Label(root, textvariable=self.status_var).grid(row=10, column=0, columnspan=2, sticky="w")
         self.progress = ttk.Progressbar(root, mode="indeterminate", length=150)
-        self.progress.grid(row=9, column=2, sticky="e")
+        self.progress.grid(row=10, column=2, sticky="e")
 
         folder_entry.focus_set()
 
@@ -196,12 +227,12 @@ class FolderSearchApp(tk.Tk):
 
     def _choose_license_app(self) -> None:
         selected = filedialog.askopenfilename(
-            title="Choose LicenseApp executable",
-            initialdir=self.license_app_var.get() or self.folder_var.get() or None,
+            title="Choose LicenseServer executable",
+            initialdir=self.server_exe_var.get() or self.folder_var.get() or None,
             filetypes=[("Executable files", "*.exe"), ("All files", "*.*")],
         )
         if selected:
-            self.license_app_var.set(selected)
+            self.server_exe_var.set(selected)
 
     def _start_search(self) -> None:
         if self._worker and self._worker.is_alive():
@@ -217,15 +248,20 @@ class FolderSearchApp(tk.Tk):
         self.cancel_button.configure(state="normal")
         self.progress.start(12)
         if self.compare_mode_var.get():
-            license_app = self.license_app_var.get().strip().strip('"')
+            server_exe = self.server_exe_var.get().strip().strip('"')
+            server_url = self.server_url_var.get().strip()
             source_file = self.source_file_var.get().strip().strip('"')
-            if not license_app or not os.path.isfile(license_app):
+            if not server_exe or not os.path.isfile(server_exe):
                 self._finish_ui()
-                messagebox.showerror(APP_TITLE, "Please choose an existing LicenseApp executable.")
+                messagebox.showerror(APP_TITLE, "Please choose an existing LicenseServer executable.")
                 return
             if not source_file or not os.path.isfile(source_file):
                 self._finish_ui()
                 messagebox.showerror(APP_TITLE, "Please choose an existing source file.")
+                return
+            if not server_url:
+                self._finish_ui()
+                messagebox.showerror(APP_TITLE, "Please enter the LicenseServer HTTP URL.")
                 return
             if not self.compare_pt_var.get() and not self.compare_ptl_var.get():
                 self._finish_ui()
@@ -236,12 +272,13 @@ class FolderSearchApp(tk.Tk):
                 messagebox.showerror(APP_TITLE, "The source file must be a .pt or .ptl file.")
                 return
             self._search_mode = "compare"
-            self.status_var.set("Comparing files...")
+            self.status_var.set("Comparing files through LicenseServer...")
             self._worker = threading.Thread(
-                target=self._compare_with_license_app,
+                target=self._compare_with_license_server,
                 args=(
                     folder,
-                    license_app,
+                    server_exe,
+                    server_url,
                     source_file,
                     self.recursive_var.get(),
                     self.compare_pt_var.get(),
@@ -291,10 +328,11 @@ class FolderSearchApp(tk.Tk):
         except OSError as error:
             self._events.put(("error", str(error)))
 
-    def _compare_with_license_app(
+    def _compare_with_license_server(
         self,
         folder: str,
-        license_app: str,
+        server_exe: str,
+        server_url: str,
         source_file: str,
         recursive: bool,
         compare_pt: bool,
@@ -306,7 +344,23 @@ class FolderSearchApp(tk.Tk):
         if compare_ptl:
             allowed_extensions.add(".ptl")
         scanned = matched = skipped = 0
+        launched_server = False
+        server_process: subprocess.Popen[bytes] | None = None
         try:
+            parsed_url = urllib.parse.urlparse(server_url)
+            if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
+                raise ValueError("Server URL must be a valid http:// or https:// address.")
+
+            if parsed_url.hostname in {"127.0.0.1", "localhost"} and parsed_url.port:
+                if not wait_for_server(parsed_url.hostname, parsed_url.port, timeout_seconds=0.5):
+                    server_process = subprocess.Popen(
+                        [server_exe],
+                        cwd=str(Path(server_exe).parent),
+                    )
+                    launched_server = True
+                    if not wait_for_server(parsed_url.hostname, parsed_url.port, timeout_seconds=30.0):
+                        raise RuntimeError("LicenseServer did not become ready on the configured host and port.")
+
             for path in self._candidate_paths(folder, recursive, allowed_extensions):
                 if self._cancel.is_set():
                     self._events.put(("done", scanned, matched, skipped, True))
@@ -315,25 +369,29 @@ class FolderSearchApp(tk.Tk):
                     continue
                 scanned += 1
                 try:
-                    result = subprocess.run(
-                        [license_app, "--match", source_file, path],
-                        capture_output=True,
-                        text=True,
-                        cwd=str(Path(license_app).parent),
-                        check=False,
-                    )
-                    output = f"{result.stdout}\n{result.stderr}"
-                    if license_app_reports_match(output):
+                    if check_match_via_server(server_url, source_file, path):
                         matched += 1
                         info = os.stat(path)
                         self._events.put(("match", Match(os.path.abspath(path), info.st_size, info.st_mtime)))
                 except (OSError, PermissionError):
                     skipped += 1
+                except (urllib.error.URLError, urllib.error.HTTPError, ValueError, json.JSONDecodeError) as error:
+                    self._events.put(("error", f"LicenseServer request failed for {path}: {error}"))
+                    return
                 if scanned % 10 == 0:
                     self._events.put(("progress", scanned, matched, skipped))
             self._events.put(("done", scanned, matched, skipped, False))
         except OSError as error:
             self._events.put(("error", str(error)))
+        except ValueError as error:
+            self._events.put(("error", str(error)))
+        finally:
+            if launched_server and server_process is not None:
+                server_process.terminate()
+                try:
+                    server_process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    server_process.kill()
 
     def _candidate_paths(self, folder: str, recursive: bool, allowed_extensions: set[str]) -> Iterator[str]:
         if recursive:
